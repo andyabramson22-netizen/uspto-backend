@@ -1,4 +1,4 @@
-// server.js - USPTO Data Backend Server (Enhanced APIs)
+// server.js - USPTO Backend with Client Database
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,39 +7,257 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Enable CORS for all origins
+// Enable CORS and JSON parsing
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Cache to avoid hitting USPTO APIs too frequently
+// In-memory database (resets on server restart)
+// For production, use a real database like PostgreSQL
+const clientDatabase = {
+    // Pre-loaded with KidneyAide
+    'kidneyaide': {
+        name: 'KidneyAide',
+        patents: [
+            {
+                patent_number: '18/751,463',
+                patent_title: 'Non-Provisional Patent Application',
+                app_date: '2024-06-12',
+                patent_date: null,
+                status: 'Pending - Non-Provisional Application'
+            },
+            {
+                patent_number: '63/523,059',
+                patent_title: 'Provisional Patent Application',
+                app_date: '2023-06-23',
+                patent_date: null,
+                status: 'Provisional Application'
+            }
+        ],
+        trademarks: [
+            {
+                serialNumber: '97665342',
+                mark: 'KIDNEYAIDE',
+                filingDate: '2022-11-15',
+                status: 'Registered'
+            },
+            {
+                serialNumber: '97762036',
+                mark: 'KIDNEYAIDE',
+                filingDate: '2023-01-20',
+                status: 'Registered'
+            },
+            {
+                serialNumber: '97762371',
+                mark: 'KIDNEYAIDE',
+                filingDate: '2023-01-21',
+                status: 'Registered'
+            }
+        ]
+    }
+};
+
+// Cache for API results
 const cache = new Map();
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
-// Helper function to get cached data
 function getCached(key) {
     const cached = cache.get(key);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        console.log(`Cache hit for: ${key}`);
         return cached.data;
     }
     return null;
 }
 
-// Helper function to set cache
 function setCache(key, data) {
     cache.set(key, { data, timestamp: Date.now() });
-    console.log(`Cache set for: ${key}`);
 }
 
-// Create axios instance that ignores SSL errors (for USPTO APIs)
+// Axios instance with SSL disabled for USPTO
 const axiosInstance = axios.create({
-    httpsAgent: new https.Agent({  
-        rejectUnauthorized: false
-    }),
+    httpsAgent: new https.Agent({ rejectUnauthorized: false }),
     timeout: 20000
 });
 
-// Search Patents Endpoint - Enhanced
+// Normalize client name for database lookup
+function normalizeClientName(name) {
+    return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// ===== ADMIN ENDPOINTS =====
+
+// Get admin interface
+app.get('/admin', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client Admin - USPTO Backend</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 2rem; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { margin-bottom: 0.5rem; color: #111; }
+        .subtitle { color: #666; margin-bottom: 2rem; }
+        .card { background: white; border-radius: 8px; padding: 2rem; margin-bottom: 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        label { display: block; font-weight: 600; margin-bottom: 0.5rem; color: #333; }
+        input, textarea { width: 100%; padding: 0.75rem; border: 2px solid #ddd; border-radius: 6px; font-size: 1rem; margin-bottom: 1rem; font-family: inherit; }
+        input:focus, textarea:focus { outline: none; border-color: #3b82f6; }
+        textarea { min-height: 150px; font-family: monospace; }
+        button { background: #3b82f6; color: white; padding: 0.75rem 2rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+        button:hover { background: #2563eb; }
+        button.secondary { background: #6b7280; margin-left: 1rem; }
+        button.secondary:hover { background: #4b5563; }
+        .client-list { display: grid; gap: 1rem; }
+        .client-item { background: #f9fafb; padding: 1rem; border-radius: 6px; border-left: 4px solid #3b82f6; }
+        .client-name { font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem; }
+        .client-stats { color: #666; font-size: 0.9rem; }
+        .success { background: #d1fae5; color: #065f46; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+        .error { background: #fee2e2; color: #991b1b; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+        .help-text { font-size: 0.875rem; color: #666; margin-bottom: 1rem; }
+        code { background: #f3f4f6; padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Client Admin Panel</h1>
+        <p class="subtitle">Add and manage your IP portfolio clients</p>
+
+        <div id="message"></div>
+
+        <div class="card">
+            <h2>Add New Client</h2>
+            <form id="addClientForm">
+                <label>Client Name *</label>
+                <input type="text" id="clientName" placeholder="e.g., KidneyAide" required>
+
+                <label>Patents (JSON Array)</label>
+                <p class="help-text">Enter as JSON array. Leave empty <code>[]</code> if no patents.</p>
+                <textarea id="patents" placeholder='[{"patent_number":"18/751,463","patent_title":"Title","app_date":"2024-06-12","patent_date":null,"status":"Pending"}]'>[</textarea>
+
+                <label>Trademarks (JSON Array)</label>
+                <p class="help-text">Enter as JSON array. Leave empty <code>[]</code> if no trademarks.</p>
+                <textarea id="trademarks" placeholder='[{"serialNumber":"97665342","mark":"MARK","filingDate":"2022-11-15","status":"Registered"}]'>[</textarea>
+
+                <button type="submit">Add Client</button>
+                <button type="button" class="secondary" onclick="clearForm()">Clear</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>Current Clients</h2>
+            <div id="clientList" class="client-list"></div>
+        </div>
+    </div>
+
+    <script>
+        function loadClients() {
+            fetch('/admin/clients')
+                .then(r => r.json())
+                .then(data => {
+                    const list = document.getElementById('clientList');
+                    if (Object.keys(data.clients).length === 0) {
+                        list.innerHTML = '<p style="color: #666;">No clients added yet.</p>';
+                        return;
+                    }
+                    list.innerHTML = Object.entries(data.clients).map(([key, client]) => \`
+                        <div class="client-item">
+                            <div class="client-name">\${client.name}</div>
+                            <div class="client-stats">
+                                📄 Patents: \${client.patents.length} | 
+                                ™ Trademarks: \${client.trademarks.length}
+                            </div>
+                        </div>
+                    \`).join('');
+                });
+        }
+
+        document.getElementById('addClientForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const msg = document.getElementById('message');
+            
+            try {
+                const patents = JSON.parse(document.getElementById('patents').value);
+                const trademarks = JSON.parse(document.getElementById('trademarks').value);
+                
+                const response = await fetch('/admin/clients', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: document.getElementById('clientName').value,
+                        patents: patents,
+                        trademarks: trademarks
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    msg.innerHTML = '<div class="success">✓ Client added successfully!</div>';
+                    clearForm();
+                    loadClients();
+                } else {
+                    msg.innerHTML = \`<div class="error">❌ Error: \${result.error}</div>\`;
+                }
+            } catch (error) {
+                msg.innerHTML = \`<div class="error">❌ Error: \${error.message}. Check your JSON format.</div>\`;
+            }
+        });
+
+        function clearForm() {
+            document.getElementById('clientName').value = '';
+            document.getElementById('patents').value = '[]';
+            document.getElementById('trademarks').value = '[]';
+            document.getElementById('message').innerHTML = '';
+        }
+
+        loadClients();
+    </script>
+</body>
+</html>
+    `);
+});
+
+// Get all clients
+app.get('/admin/clients', (req, res) => {
+    res.json({ clients: clientDatabase });
+});
+
+// Add or update client
+app.post('/admin/clients', (req, res) => {
+    const { name, patents, trademarks } = req.body;
+    
+    if (!name) {
+        return res.status(400).json({ error: 'Client name is required' });
+    }
+    
+    const key = normalizeClientName(name);
+    clientDatabase[key] = {
+        name: name,
+        patents: patents || [],
+        trademarks: trademarks || []
+    };
+    
+    console.log(`Client added/updated: ${name}`);
+    res.json({ success: true, message: 'Client added successfully', key: key });
+});
+
+// Delete client
+app.delete('/admin/clients/:name', (req, res) => {
+    const key = normalizeClientName(req.params.name);
+    if (clientDatabase[key]) {
+        delete clientDatabase[key];
+        res.json({ success: true, message: 'Client deleted' });
+    } else {
+        res.status(404).json({ error: 'Client not found' });
+    }
+});
+
+// ===== PUBLIC API ENDPOINTS =====
+
+// Search Patents
 app.get('/api/patents/search', async (req, res) => {
     const { assignee } = req.query;
     
@@ -47,126 +265,77 @@ app.get('/api/patents/search', async (req, res) => {
         return res.status(400).json({ error: 'Assignee parameter required' });
     }
 
-    console.log(`Patent search request for: ${assignee}`);
+    console.log(`Patent search: ${assignee}`);
 
     const cacheKey = `patents:${assignee.toLowerCase()}`;
     const cached = getCached(cacheKey);
-    if (cached) {
-        return res.json(cached);
+    if (cached) return res.json(cached);
+
+    // Check client database first
+    const normalizedName = normalizeClientName(assignee);
+    if (clientDatabase[normalizedName]) {
+        console.log(`Using client database for: ${assignee}`);
+        const patents = clientDatabase[normalizedName].patents;
+        const granted = patents.filter(p => p.patent_date).length;
+        const result = {
+            total: patents.length,
+            granted: granted,
+            applications: patents.length - granted,
+            list: patents,
+            source: 'client_database'
+        };
+        setCache(cacheKey, result);
+        return res.json(result);
     }
 
+    // Try USPTO APIs
     try {
-        let allPatents = [];
-
-        // Method 1: Try USPTO Patent Examination Data System (PEDS)
-        try {
-            console.log('Trying USPTO PEDS API...');
-            const pedsUrl = 'https://ped.uspto.gov/api/queries';
-            const pedsResponse = await axiosInstance.post(pedsUrl, {
-                searchText: `(AN/"${assignee}")`,
-                qf: 'patentTitle',
-                fl: '*',
-                facet: true,
-                sort: 'applId desc',
-                start: 0,
-                rows: 100
-            }, {
-                headers: { 'Content-Type': 'application/json' }
-            });
-
-            if (pedsResponse.data?.queryResults?.searchResponse?.response?.docs) {
-                const docs = pedsResponse.data.queryResults.searchResponse.response.docs;
-                console.log(`PEDS returned ${docs.length} results`);
-                allPatents = docs.map(p => ({
-                    patent_number: p.patentNumber || p.appEarlyPubNumber || p.applicationNumberText,
-                    patent_title: p.inventionTitle || p.patentTitle,
-                    app_date: p.appFilingDate,
-                    patent_date: p.patentIssueDate,
-                    status: p.appStatus || (p.patentIssueDate ? 'Granted' : 'Pending'),
-                    type: p.appType
-                }));
+        const pvQuery = {
+            "_or": [
+                { "assignee_organization": assignee },
+                { "_text_any": { "assignee_organization": assignee } }
+            ]
+        };
+        
+        const pvResponse = await axiosInstance.get('https://api.patentsview.org/patents/query', {
+            params: {
+                q: JSON.stringify(pvQuery),
+                f: '["patent_number","patent_title","patent_date","app_date"]',
+                o: '{"per_page":100}'
             }
-        } catch (pedsError) {
-            console.log('PEDS API failed:', pedsError.message);
-        }
+        });
 
-        // Method 2: Try PatentsView API (for granted patents)
-        if (allPatents.length === 0) {
-            try {
-                console.log('Trying PatentsView API...');
-                const pvQuery = {
-                    "_or": [
-                        { "assignee_organization": assignee },
-                        { "_text_any": { "assignee_organization": assignee } }
-                    ]
-                };
-                
-                const pvUrl = 'https://api.patentsview.org/patents/query';
-                const pvResponse = await axiosInstance.get(pvUrl, {
-                    params: {
-                        q: JSON.stringify(pvQuery),
-                        f: '["patent_number","patent_title","patent_date","app_date","assignee_organization"]',
-                        o: '{"per_page":100}'
-                    }
-                });
-
-                if (pvResponse.data?.patents?.length > 0) {
-                    console.log(`PatentsView returned ${pvResponse.data.patents.length} results`);
-                    allPatents = pvResponse.data.patents.map(p => ({
-                        ...p,
-                        status: p.patent_date ? 'Granted' : 'Pending'
-                    }));
-                }
-            } catch (pvError) {
-                console.log('PatentsView API failed:', pvError.message);
-            }
-        }
-
-        // Method 3: Try USPTO Public Search (web scraping alternative)
-        if (allPatents.length === 0) {
-            console.log('Trying USPTO Public Patent Search...');
-            // This would require more complex scraping - skipping for now
-        }
-
-        if (allPatents.length > 0) {
-            const granted = allPatents.filter(p => p.patent_date).length;
+        if (pvResponse.data?.patents?.length > 0) {
+            const patents = pvResponse.data.patents.map(p => ({
+                ...p,
+                status: p.patent_date ? 'Granted' : 'Pending'
+            }));
+            const granted = patents.filter(p => p.patent_date).length;
             const result = {
-                total: allPatents.length,
+                total: patents.length,
                 granted: granted,
-                applications: allPatents.length - granted,
-                list: allPatents,
+                applications: patents.length - granted,
+                list: patents,
                 source: 'uspto_api'
             };
-
             setCache(cacheKey, result);
             return res.json(result);
         }
-
-        // No results found
-        console.log(`No patents found for: ${assignee}`);
-        res.json({ 
-            total: 0, 
-            granted: 0, 
-            applications: 0, 
-            list: [], 
-            source: 'none',
-            message: 'No patents found. This could mean: (1) No patents/applications filed, (2) Patents under different legal name, (3) API limitations for pending applications'
-        });
-
     } catch (error) {
-        console.error('Patent search error:', error.message);
-        res.json({ 
-            total: 0, 
-            granted: 0, 
-            applications: 0, 
-            list: [],
-            source: 'error',
-            error: error.message 
-        });
+        console.log('API error:', error.message);
     }
+
+    res.json({ 
+        total: 0, 
+        granted: 0, 
+        applications: 0, 
+        list: [], 
+        source: 'none',
+        message: 'No patents found in USPTO APIs. Add client to database for accurate data.'
+    });
 });
 
-// Search Trademarks Endpoint - Enhanced
+// Search Trademarks
 app.get('/api/trademarks/search', async (req, res) => {
     const { owner } = req.query;
     
@@ -174,119 +343,97 @@ app.get('/api/trademarks/search', async (req, res) => {
         return res.status(400).json({ error: 'Owner parameter required' });
     }
 
-    console.log(`Trademark search request for: ${owner}`);
+    console.log(`Trademark search: ${owner}`);
 
     const cacheKey = `trademarks:${owner.toLowerCase()}`;
     const cached = getCached(cacheKey);
-    if (cached) {
-        return res.json(cached);
+    if (cached) return res.json(cached);
+
+    // Check client database first
+    const normalizedName = normalizeClientName(owner);
+    if (clientDatabase[normalizedName]) {
+        console.log(`Using client database for: ${owner}`);
+        const trademarks = clientDatabase[normalizedName].trademarks;
+        const registered = trademarks.filter(tm => 
+            tm.status && tm.status.toLowerCase().includes('registered')
+        ).length;
+        const result = {
+            total: trademarks.length,
+            registered: registered,
+            applications: trademarks.length - registered,
+            list: trademarks,
+            source: 'client_database'
+        };
+        setCache(cacheKey, result);
+        return res.json(result);
     }
 
+    // Try USPTO API
     try {
-        let allTrademarks = [];
+        const tsdrResponse = await axiosInstance.get('https://tsdr.uspto.gov/statusview/search', {
+            params: { q: owner, rows: 100, wt: 'json' }
+        });
 
-        // Method 1: Try USPTO TSDR Status API
-        try {
-            console.log('Trying USPTO TSDR API...');
-            const tsdrUrl = 'https://tsdr.uspto.gov/statusview/search';
-            const tsdrResponse = await axiosInstance.get(tsdrUrl, {
-                params: {
-                    q: owner,
-                    rows: 100,
-                    wt: 'json'
-                }
-            });
-
-            if (tsdrResponse.data?.response?.docs?.length > 0) {
-                const docs = tsdrResponse.data.response.docs;
-                console.log(`TSDR returned ${docs.length} results`);
-                allTrademarks = docs.map(tm => ({
-                    serialNumber: tm.applicationSerialNumber || tm.registrationNumber,
-                    mark: tm.markLiteralElementText || tm.markDrawingCode,
-                    filingDate: tm.applicationFilingDate,
-                    status: tm.markCurrentStatusExternalDescriptionText,
-                    owner: tm.ownerName
-                }));
-            }
-        } catch (tsdrError) {
-            console.log('TSDR API failed:', tsdrError.message);
-        }
-
-        // Method 2: Try alternative trademark search
-        if (allTrademarks.length === 0) {
-            console.log('Trying USPTO Trademark Status & Document Retrieval...');
-            // Additional methods could be added here
-        }
-
-        if (allTrademarks.length > 0) {
-            const registered = allTrademarks.filter(tm => 
+        if (tsdrResponse.data?.response?.docs?.length > 0) {
+            const docs = tsdrResponse.data.response.docs;
+            const trademarks = docs.map(tm => ({
+                serialNumber: tm.applicationSerialNumber || tm.registrationNumber,
+                mark: tm.markLiteralElementText || tm.markDrawingCode,
+                filingDate: tm.applicationFilingDate,
+                status: tm.markCurrentStatusExternalDescriptionText
+            }));
+            const registered = trademarks.filter(tm => 
                 tm.status && tm.status.toLowerCase().includes('registered')
             ).length;
-
             const result = {
-                total: allTrademarks.length,
+                total: trademarks.length,
                 registered: registered,
-                applications: allTrademarks.length - registered,
-                list: allTrademarks,
+                applications: trademarks.length - registered,
+                list: trademarks,
                 source: 'uspto_api'
             };
-
             setCache(cacheKey, result);
             return res.json(result);
         }
-
-        // No results found
-        console.log(`No trademarks found for: ${owner}`);
-        res.json({ 
-            total: 0, 
-            registered: 0, 
-            applications: 0, 
-            list: [], 
-            source: 'none',
-            message: 'No trademarks found. Try exact legal entity name (e.g., "Company Inc.", "Company LLC")'
-        });
-
     } catch (error) {
-        console.error('Trademark search error:', error.message);
-        res.json({ 
-            total: 0, 
-            registered: 0, 
-            applications: 0, 
-            list: [],
-            source: 'error',
-            error: error.message 
-        });
+        console.log('API error:', error.message);
     }
+
+    res.json({ 
+        total: 0, 
+        registered: 0, 
+        applications: 0, 
+        list: [], 
+        source: 'none',
+        message: 'No trademarks found in USPTO APIs. Add client to database for accurate data.'
+    });
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: new Date().toISOString(),
-        cacheSize: cache.size 
+        clients: Object.keys(clientDatabase).length
     });
 });
 
-// Root endpoint
+// Root
 app.get('/', (req, res) => {
     res.json({
-        service: 'USPTO IP Portfolio Backend',
-        version: '2.0.0',
+        service: 'USPTO IP Portfolio Backend with Client Database',
+        version: '3.0.0',
         endpoints: {
+            admin: '/admin (Manage clients)',
             patents: '/api/patents/search?assignee=CompanyName',
             trademarks: '/api/trademarks/search?owner=CompanyName',
             health: '/health'
-        },
-        note: 'Enhanced with multiple USPTO data sources for better coverage'
+        }
     });
 });
 
-// Start server
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 USPTO Backend Server running on port ${PORT}`);
-    console.log(`📍 Patent API: /api/patents/search?assignee=YourCompany`);
-    console.log(`📍 Trademark API: /api/trademarks/search?owner=YourCompany`);
-    console.log(`💚 Health Check: /health`);
-    console.log(`🔍 Enhanced with multiple data sources for better coverage`);
+    console.log(`🚀 USPTO Backend running on port ${PORT}`);
+    console.log(`🔐 Admin panel: http://localhost:${PORT}/admin`);
+    console.log(`💾 Clients in database: ${Object.keys(clientDatabase).length}`);
 });
